@@ -7,6 +7,7 @@
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/Character.h"
 #include "GenericTeamAgentInterface.h"
+#include "TimerManager.h"
 #include "SabrinaCharacter.generated.h"
 
 class UStaticMeshComponent;
@@ -14,6 +15,8 @@ class ABaseMagicProjectile;
 class UAnimMontage;
 class UPlayerHUDWidget;
 class UTexture2D;
+class UStaticMesh;
+class UMaterialInterface;
 
 UCLASS()
 class MYPROJECT_API ASabrinaCharacter : public ACharacter, public IGenericTeamAgentInterface
@@ -109,6 +112,59 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Magic|Weapon|Animation")
 	UAnimMontage* PickupMontage;
 
+	// --- Перезарядка (лаб. 6): "магазин" з зарядів сфери ---
+	// Вимкни галочку, щоб перезарядки не було (стара поведінка з попередніх лаб)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Player|Reload")
+	bool bReloadEnabled = true;
+
+	// Скільки пострілів сферою в "магазині"
+	UPROPERTY(EditAnywhere, Category = "Player|Reload", meta = (ClampMin = "1"))
+	int32 MaxOrbCharges = 6;
+
+	// Монтаж перезарядки (AM_Reload)
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Reload")
+	UAnimMontage* ReloadMontage;
+
+	// Кристал-"набій", який матеріалізується в лівій руці й вкладається в паличку.
+	// Постав той самий меш, що й у кристала мани (MagicPickup), або свій.
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Reload|Crystal")
+	UStaticMesh* ReloadCrystalMesh;
+
+	// Матеріал кристала (наприклад MI_ManaCrystal). Порожньо = матеріал меша
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Reload|Crystal")
+	UMaterialInterface* ReloadCrystalMaterial;
+
+	// Кістка лівої руки, де з'являється кристал
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal")
+	FName ReloadHandBoneName = TEXT("hand_l");
+
+	// Зміщення кристала від кістки руки (у світових осях, см), щоб лежав на долоні
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal")
+	FVector ReloadCrystalOffset = FVector(0.0f, 0.0f, 6.0f);
+
+	// Тонка підгонка точки вкладання (світові осі, см) відносно верхівки палички
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal")
+	FVector ReloadWandTipOffset = FVector::ZeroVector;
+
+	// Кінцевий масштаб кристала
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal")
+	float ReloadCrystalScale = 0.3f;
+
+	// Моменти перезарядки у частках її тривалості (0..1):
+	// з'являється -> повністю матеріалізований -> долітає до палички -> зникає
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal", meta = (ClampMin = "0", ClampMax = "1"))
+	float CrystalAppearStart = 0.20f;
+
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal", meta = (ClampMin = "0", ClampMax = "1"))
+	float CrystalAppearEnd = 0.40f;
+
+	UPROPERTY(EditAnywhere, Category = "Player|Reload|Crystal", meta = (ClampMin = "0", ClampMax = "1"))
+	float CrystalInsertEnd = 0.65f;
+
+	// Тривалість, якщо монтаж не заданий
+	UPROPERTY(EditAnywhere, Category = "Player|Reload")
+	float FallbackReloadDuration = 2.0f;
+
 	// --- Здоров'я (методичка, п.6) ---
 	UPROPERTY(EditAnywhere, Category = "Player|Health")
 	float MaxHealth = 100.0f;
@@ -179,11 +235,31 @@ public:
 	void GiveKey();
 	bool HasKey() const { return bHasKey; }
 
+	UFUNCTION(BlueprintPure, Category = "Player|Reload")
+	bool IsReloading() const { return bIsReloading; }
+
 	// Короткий напис на екрані
 	void ShowHUDMessage(const FString& Message, float Duration = 2.5f);
 
 private:
 	bool bHasKey = false;
+
+	// Перезарядка
+	int32 OrbCharges = 0;
+	bool bIsReloading = false;
+	FTimerHandle ReloadTimerHandle;
+	float ReloadElapsed = 0.0f;
+	float ReloadTotal = 1.0f;
+
+	UPROPERTY()
+	UStaticMeshComponent* ReloadCrystalComponent;
+
+	void UpdateReloadCrystal(float DeltaTime);
+
+	void StartReload();
+	void FinishReload();
+	void ReloadPressed();
+	void ShowAmmoOnScreen() const;
 
 	float OrbCooldownRemaining = 0.0f;
 	float BeamCooldownRemaining = 0.0f;

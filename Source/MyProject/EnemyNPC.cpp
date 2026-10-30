@@ -1,4 +1,4 @@
-// Лабораторна робота 5: NPC ворог з ШІ
+// Лабораторні роботи 5-6: NPC ворог з ШІ, анімація зброї
 
 #include "EnemyNPC.h"
 #include "EnemyAIController.h"
@@ -37,6 +37,11 @@ AEnemyNPC::AEnemyNPC()
 	WeaponComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WeaponComponent"));
 	WeaponComponent->SetupAttachment(GetMesh(), WeaponSocketName);
 	WeaponComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// Точка за спиною на кістці спини (spine_03 у скелеті UE5; якщо в твоєму скелеті інакше -
+	// змініть Parent Socket у BP). Положення можна підкрутити у вʼюпорті BP
+	WeaponBackAnchor = CreateDefaultSubobject<USceneComponent>(TEXT("WeaponBackAnchor"));
+	WeaponBackAnchor->SetupAttachment(GetMesh(), TEXT("spine_03"));
 
 	AuraLight = CreateDefaultSubobject<UPointLightComponent>(TEXT("AuraLight"));
 	AuraLight->SetupAttachment(RootComponent);
@@ -77,6 +82,13 @@ void AEnemyNPC::BeginPlay()
 		WeaponComponent->AttachToComponent(GetMesh(),
 			FAttachmentTransformRules::SnapToTargetNotIncludingScale, WeaponSocketName);
 	}
+
+	// Піднята поза = поточне положення зброї в BP. Старт - з опущеною зброєю
+	if (WeaponComponent)
+	{
+		WeaponRaisedRelative = WeaponComponent->GetRelativeTransform();
+		UpdateWeaponPose(0.0f);
+	}
 }
 
 void AEnemyNPC::Tick(float DeltaTime)
@@ -90,11 +102,205 @@ void AEnemyNPC::Tick(float DeltaTime)
 
 	UpdateLocomotionAnimation();
 	UpdateHealthWidgetFacing();
+	UpdateWeaponPose(DeltaTime);
+}
+
+// Анімація взаємодії зі зброєю: плавно піднімає її, коли гравець у радіусі пострілу,
+// і ховає її за спину, коли той віддалився
+void AEnemyNPC::UpdateWeaponPose(float DeltaTime)
+{
+	if (!WeaponComponent)
+	{
+		return;
+	}
+
+	if (!bWeaponPoseEnabled)
+	{
+		bWeaponRaised = true;
+		WeaponAlpha = 1.0f;
+		WeaponComponent->SetRelativeTransform(WeaponRaisedRelative);
+		return;
+	}
+
+	// Зброя має бути піднята, якщо гравець близько або йде удар; гістерезис проти смикання на межі
+	bool bShouldRaise = bWeaponRaised;
+	if (const APawn* Player = UGameplayStatics::GetPlayerPawn(this, 0))
+	{
+		const float Dist = FVector::Dist(GetActorLocation(), Player->GetActorLocation());
+		if (Dist <= WeaponRaiseRadius)
+		{
+			bShouldRaise = true;
+		}
+		else if (Dist >= WeaponRaiseRadius + WeaponLowerHysteresis)
+		{
+			bShouldRaise = false;
+		}
+	}
+	else
+	{
+		bShouldRaise = false;
+	}
+	if (bIsAttacking)
+	{
+		bShouldRaise = true;
+	}
+
+	// Анімація діставання/ховання йде: стан змінить SwitchWeaponState, тут лише ставимо позу
+	const bool bUseAnims = (WeaponDrawAnim || WeaponHolsterAnim);
+	if (bWeaponAnimPlaying)
+	{
+		bShouldRaise = bWeaponRaised;
+	}
+	else if (bUseAnims && bShouldRaise != bWeaponRaised && !bIsAttacking && !bIsDodging)
+	{
+		UAnimSequence* Needed = bShouldRaise ? WeaponDrawAnim
+			: (WeaponHolsterAnim ? WeaponHolsterAnim : (bReverseDrawAsHolster ? WeaponDrawAnim : nullptr));
+		if (Needed)
+		{
+			StartWeaponAnim(bShouldRaise);
+			bShouldRaise = bWeaponRaised;
+		}
+	}
+
+	if (bShouldRaise != bWeaponRaised)
+	{
+		bWeaponRaised = bShouldRaise;
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(7103, 2.0f, FColor::Orange,
+				bWeaponRaised ? TEXT("NPC: дістає зброю") : TEXT("NPC: ховає зброю за спину"));
+		}
+	}
+
+	if (bWeaponAnimPlaying)
+	{
+		// поза не інтерполюється: зброя миттєво "перескакує" в потрібний момент анімації
+		WeaponAlpha = bWeaponRaised ? 1.0f : 0.0f;
+	}
+	else if (bUseAnims && !(bIsAttacking && WeaponAlpha < 1.0f))
+	{
+		WeaponAlpha = bWeaponRaised ? 1.0f : 0.0f;
+	}
+	else
+	{
+		WeaponAlpha = FMath::FInterpConstantTo(WeaponAlpha, bWeaponRaised ? 1.0f : 0.0f, DeltaTime, 1.0f / WeaponRaiseTime);
+	}
+	const float S = FMath::InterpEaseInOut(0.0f, 1.0f, WeaponAlpha, 2.0f);
+
+	// Піднята поза - у руці (відносно сокета руки). Захована - у WeaponBackAnchor: перераховуємо
+	// її з світових координат у простір сокета руки, тож зброя їде за спиною разом з анімацією
+	const FVector RaisedLoc = WeaponRaisedRelative.GetLocation();
+	const FQuat RaisedQuat = WeaponRaisedRelative.GetRotation();
+
+	FVector HiddenLoc = RaisedLoc;
+	FQuat HiddenQuat = RaisedQuat;
+	if (WeaponBackAnchor && GetMesh())
+	{
+		const FTransform HandWorld = GetMesh()->GetSocketTransform(WeaponComponent->GetAttachSocketName(), RTS_World);
+		const FTransform BackRelative = WeaponBackAnchor->GetComponentTransform().GetRelativeTransform(HandWorld);
+		HiddenLoc = BackRelative.GetLocation();
+		HiddenQuat = BackRelative.GetRotation();
+	}
+
+	WeaponComponent->SetRelativeLocationAndRotation(
+		FMath::Lerp(HiddenLoc, RaisedLoc, S),
+		FQuat::Slerp(HiddenQuat, RaisedQuat, S));
+}
+
+void AEnemyNPC::StartWeaponAnim(bool bRaise)
+{
+	UAnimSequence* Anim = bRaise ? WeaponDrawAnim : WeaponHolsterAnim;
+	bool bReversed = false;
+	if (!bRaise && !Anim && bReverseDrawAsHolster)
+	{
+		Anim = WeaponDrawAnim;
+		bReversed = true;
+	}
+	if (!Anim || !GetMesh())
+	{
+		return;
+	}
+
+	bWeaponAnimPlaying = true;
+	bPendingWeaponRaised = bRaise;
+
+	// Під час анімації NPC стоїть на місці
+	GetCharacterMovement()->StopMovementImmediately();
+	GetCharacterMovement()->DisableMovement();
+
+	const float Length = FMath::Max(Anim->GetPlayLength(), 0.3f);
+	GetMesh()->PlayAnimation(Anim, false);
+	if (bReversed)
+	{
+		// те саме "діставання", але від кінця до початку
+		GetMesh()->SetPosition(Anim->GetPlayLength(), false);
+		GetMesh()->SetPlayRate(-1.0f);
+	}
+	else
+	{
+		GetMesh()->SetPlayRate(1.0f);
+	}
+	CurrentAnim = Anim;
+
+	// при зворотному програванні момент перемикання зеркальний
+	const float SwitchFrac = FMath::Clamp(bReversed ? 1.0f - WeaponSwitchFraction : WeaponSwitchFraction, 0.0f, 1.0f);
+	GetWorldTimerManager().SetTimer(WeaponSwitchTimer, this, &AEnemyNPC::SwitchWeaponState,
+		Length * SwitchFrac + 0.001f, false);
+	GetWorldTimerManager().SetTimer(WeaponAnimEndTimer, this, &AEnemyNPC::EndWeaponAnim, Length, false);
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(7103, 2.0f, FColor::Orange,
+			bRaise ? TEXT("NPC: дістає зброю (анімація)") : TEXT("NPC: ховає зброю за спину (анімація)"));
+	}
+}
+
+void AEnemyNPC::SwitchWeaponState()
+{
+	bWeaponRaised = bPendingWeaponRaised;
+}
+
+void AEnemyNPC::EndWeaponAnim()
+{
+	if (!bWeaponAnimPlaying)
+	{
+		return;
+	}
+	bWeaponAnimPlaying = false;
+	bWeaponRaised = bPendingWeaponRaised;
+	if (GetMesh())
+	{
+		GetMesh()->SetPlayRate(1.0f);
+	}
+	if (!bIsDead)
+	{
+		GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+		CurrentAnim = nullptr;
+	}
+}
+
+// Атака чи ухилення перебивають анімацію зброї: зброя лишається в бойовій позі
+void AEnemyNPC::CancelWeaponAnim()
+{
+	if (!bWeaponAnimPlaying)
+	{
+		return;
+	}
+	GetWorldTimerManager().ClearTimer(WeaponSwitchTimer);
+	GetWorldTimerManager().ClearTimer(WeaponAnimEndTimer);
+	bWeaponAnimPlaying = false;
+	bWeaponRaised = true;
+	if (GetMesh())
+	{
+		GetMesh()->SetPlayRate(1.0f);
+	}
+	GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+	CurrentAnim = nullptr;
 }
 
 void AEnemyNPC::UpdateLocomotionAnimation()
 {
-	if (bIsAttacking || bIsDodging || !GetMesh())
+	if (bIsAttacking || bIsDodging || bWeaponAnimPlaying || !GetMesh())
 	{
 		return;
 	}
@@ -144,6 +350,7 @@ bool AEnemyNPC::StartAttack()
 		return false;
 	}
 
+	CancelWeaponAnim();
 	LastAttackTime = World->GetTimeSeconds();
 	bIsAttacking = true;
 
@@ -232,15 +439,28 @@ float AEnemyNPC::TakeDamage(float DamageAmount, FDamageEvent const& DamageEvent,
 
 void AEnemyNPC::Dodge(AActor* Attacker, float Chance)
 {
+	CancelWeaponAnim();
 	LastDodgeTime = GetWorld()->GetTimeSeconds();
 	bIsDodging = true;
 
-	// Крок убік, перпендикулярно напрямку до атакуючого, випадково вліво або вправо
-	FVector ToAttacker = (Attacker->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
-	FVector Side = FVector::CrossProduct(FVector::UpVector, ToAttacker);
-	if (FMath::RandBool())
+	// Напрямок відскоку за налаштуванням DodgeDirection. Up x ToAttacker = вправо від NPC,
+	// коли він дивиться на атакуючого
+	const FVector ToAttacker = (Attacker->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+	const FVector Right = FVector::CrossProduct(FVector::UpVector, ToAttacker);
+	FVector Side = Right;
+	switch (DodgeDirection)
 	{
-		Side = -Side;
+	case ENPCDodgeDirection::Left:
+		Side = -Right;
+		break;
+	case ENPCDodgeDirection::Backward:
+		Side = -ToAttacker;
+		break;
+	case ENPCDodgeDirection::Random:
+		Side = FMath::RandBool() ? Right : -Right;
+		break;
+	default:
+		break;
 	}
 	LaunchCharacter(Side * DodgeLaunchSpeed + FVector(0.0f, 0.0f, 150.0f), true, true);
 

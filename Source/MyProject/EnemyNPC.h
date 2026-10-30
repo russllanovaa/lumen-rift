@@ -1,4 +1,4 @@
-// Лабораторна робота 5: NPC ворог з ШІ (AIController + AIPerception + Behavior Tree)
+// Лабораторні роботи 5-6: NPC ворог з ШІ (AIController + AIPerception + Behavior Tree), анімація зброї
 
 #pragma once
 
@@ -7,10 +7,21 @@
 #include "EnemyNPC.generated.h"
 
 class UStaticMeshComponent;
+class USceneComponent;
 class UWidgetComponent;
 class UAnimSequence;
 class UNiagaraSystem;
 class UPointLightComponent;
+
+// Куди відскакує NPC при ухиленні (щоб збігалося з анімацією DodgeAnim)
+UENUM(BlueprintType)
+enum class ENPCDodgeDirection : uint8
+{
+	Right    UMETA(DisplayName = "Вправо"),
+	Left     UMETA(DisplayName = "Вліво"),
+	Backward UMETA(DisplayName = "Назад"),
+	Random   UMETA(DisplayName = "Випадково вліво/вправо")
+};
 
 /**
  * NPC ворог на шаблонному скелеті (Skeleton Necromancer). На відміну від AEnemy
@@ -51,6 +62,11 @@ protected:
 	void UpdateLocomotionAnimation();
 	void UpdateSpeed();
 	void UpdateHealthWidgetFacing();
+	void UpdateWeaponPose(float DeltaTime);
+	void StartWeaponAnim(bool bRaise);
+	void SwitchWeaponState();
+	void EndWeaponAnim();
+	void CancelWeaponAnim();
 	void RefreshHealthWidget();
 
 	void ApplyAttackHit();
@@ -62,6 +78,11 @@ protected:
 	// Зброя - окремий статичний меш на сокеті скелета
 	UPROPERTY(VisibleAnywhere, Category = "NPC|Components")
 	UStaticMeshComponent* WeaponComponent;
+
+	// Точка за спиною, куди ховається зброя (прикріплена до кістки спини, у BP її можна
+	// пересунути/повернути у вʼюпорті, щоб посох лежав за спиною як треба)
+	UPROPERTY(VisibleAnywhere, Category = "NPC|Components")
+	USceneComponent* WeaponBackAnchor;
 
 	UPROPERTY(VisibleAnywhere, Category = "NPC|Components")
 	UWidgetComponent* HealthWidgetComponent;
@@ -121,6 +142,49 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "NPC|Dodge")
 	float DodgeLaunchSpeed = 700.0f;
 
+	// Напрямок відскоку відносно NPC. Став таким, як у твоєї анімації ухилення
+	// (v2_Dodging_Right = Вправо)
+	UPROPERTY(EditAnywhere, Category = "NPC|Dodge")
+	ENPCDodgeDirection DodgeDirection = ENPCDodgeDirection::Right;
+
+	// --- Зброя: опущена / піднята (лаб. 6) ---
+	// Вимкнути - NPC завжди тримає зброю піднятою, як у лаб. 5
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	bool bWeaponPoseEnabled = true;
+
+	// Коли гравець ближче за цей радіус, NPC піднімає зброю й тримає її готовою, см
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	float WeaponRaiseRadius = 1200.0f;
+
+	// Зброя ховається знову, коли гравець відійшов далі за WeaponRaiseRadius + цей запас (щоб не смикалась на межі)
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	float WeaponLowerHysteresis = 200.0f;
+
+	// Тривалість піднімання/опускання, с
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose", meta = (ClampMin = "0.1"))
+	float WeaponRaiseTime = 0.6f;
+
+	// АНІМАЦІЇ взаємодії зі зброєю (Mixamo / власні). Якщо задані - NPC відтворює їх, коли дістає
+	// чи ховає зброю (під час анімації він стоїть на місці). Порожньо - проста плавна анімація зброї.
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	UAnimSequence* WeaponDrawAnim = nullptr;
+
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	UAnimSequence* WeaponHolsterAnim = nullptr;
+
+	// Якщо Weapon Holster Anim порожня: ховати зброю, програючи Weapon Draw Anim у зворотному напрямку
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose")
+	bool bReverseDrawAsHolster = true;
+
+	// У який момент анімації (частка 0..1) зброя "перестрибує" зі спини в руку (при діставанні)
+	// або з руки на спину (при ховані): має збігатися з моментом, коли рука торкається зброї
+	UPROPERTY(EditAnywhere, Category = "NPC|WeaponPose", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WeaponSwitchFraction = 0.5f;
+
+	// ПІДНЯТА поза - це те, як зброя стоїть у руці в BP зараз (Transform компонента WeaponComponent).
+	// ЗАХОВАНА поза - зброя лежить у точці WeaponBackAnchor за спиною (кістка спини; назва
+	// кістки в Details компонента WeaponBackAnchor -> Parent Socket)
+
 	// --- Здоров'я ---
 	UPROPERTY(EditAnywhere, Category = "NPC|Health")
 	float MaxHealth = 100.0f;
@@ -162,6 +226,16 @@ private:
 
 	UPROPERTY()
 	UAnimSequence* CurrentAnim = nullptr;
+
+	// Анімація зброї: 0 - опущена, 1 - піднята
+	bool bWeaponRaised = false;
+	float WeaponAlpha = 0.0f;
+	FTransform WeaponRaisedRelative;
+
+	bool bWeaponAnimPlaying = false;
+	bool bPendingWeaponRaised = false;
+	FTimerHandle WeaponSwitchTimer;
+	FTimerHandle WeaponAnimEndTimer;
 
 	FTimerHandle AttackHitTimer;
 	FTimerHandle AttackEndTimer;

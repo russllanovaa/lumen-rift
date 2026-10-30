@@ -10,6 +10,13 @@
 #include "Camera/PlayerCameraManager.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "SlidingBlock.h"
+#include "TimerManager.h"
+#include "Engine/StaticMesh.h"
+#include "Materials/MaterialInterface.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimInstance.h"
+#include "Engine/Engine.h"
+#include "InputCoreTypes.h"
 
 // Sets default values
 ASabrinaCharacter::ASabrinaCharacter()
@@ -35,6 +42,13 @@ ASabrinaCharacter::ASabrinaCharacter()
 	WandMeshComponent->bCastDynamicShadow = false;
 	WandMeshComponent->CastShadow = false;
 
+	// Кристал для перезарядки (за замовчуванням прихований, без колізії)
+	ReloadCrystalComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("ReloadCrystalComponent"));
+	ReloadCrystalComponent->SetupAttachment(GetMesh());
+	ReloadCrystalComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ReloadCrystalComponent->CastShadow = false;
+	ReloadCrystalComponent->SetVisibility(false);
+
 	// Щоб персонаж міг штовхати фізичні об'єкти (книга, квітка): сильніша тяга
 	GetCharacterMovement()->bEnablePhysicsInteraction = true;
 	GetCharacterMovement()->PushForceFactor = 2000000.0f;
@@ -53,6 +67,16 @@ void ASabrinaCharacter::BeginPlay()
 
 	Health = MaxHealth;
 	Mana = MaxMana;
+	OrbCharges = MaxOrbCharges;
+
+	if (ReloadCrystalMesh)
+	{
+		ReloadCrystalComponent->SetStaticMesh(ReloadCrystalMesh);
+	}
+	if (ReloadCrystalMaterial)
+	{
+		ReloadCrystalComponent->SetMaterial(0, ReloadCrystalMaterial);
+	}
 
 	GetCapsuleComponent()->OnComponentHit.AddDynamic(this, &ASabrinaCharacter::OnCapsuleHit);
 
@@ -83,6 +107,89 @@ void ASabrinaCharacter::Tick(float DeltaTime)
 
 	UpdateHUDMana();
 	UpdateHUDAbilities();
+
+	// Авто-перезарядка, коли заряди скінчились
+	if (bReloadEnabled && !bIsReloading && OrbCharges <= 0 && OrbCooldownRemaining <= 0.0f)
+	{
+		StartReload();
+	}
+	ShowAmmoOnScreen();
+	UpdateReloadCrystal(DeltaTime);
+}
+
+void ASabrinaCharacter::UpdateReloadCrystal(float DeltaTime)
+{
+	if (!ReloadCrystalComponent || !ReloadCrystalComponent->GetStaticMesh())
+	{
+		return;
+	}
+
+	if (!bIsReloading)
+	{
+		ReloadCrystalComponent->SetVisibility(false);
+		return;
+	}
+
+	ReloadElapsed += DeltaTime;
+	const float F = FMath::Clamp(ReloadElapsed / FMath::Max(ReloadTotal, 0.01f), 0.0f, 1.0f);
+
+	if (F < CrystalAppearStart || F > CrystalInsertEnd)
+	{
+		ReloadCrystalComponent->SetVisibility(false);
+		return;
+	}
+
+	const FVector HandPos = GetMesh()->GetSocketLocation(ReloadHandBoneName) + ReloadCrystalOffset;
+	// Кристал вкладається у ВЕРХІВКУ палички: беремо той кінець довгої осі меша палички,
+	// який далі від руки (рука тримає низ, верх - вільний кінець)
+	FVector WandPos = GetMesh()->DoesSocketExist(WandSocketName)
+		? GetMesh()->GetSocketLocation(WandSocketName)
+		: HandPos;
+	if (WandMeshComponent && WandMeshComponent->GetStaticMesh())
+	{
+		const FBox LocalBox = WandMeshComponent->GetStaticMesh()->GetBoundingBox();
+		const FVector Ext = LocalBox.GetExtent();
+		const FVector Center = LocalBox.GetCenter();
+		int32 Axis = 0;
+		if (Ext.Y > Ext[Axis]) { Axis = 1; }
+		if (Ext.Z > Ext[Axis]) { Axis = 2; }
+
+		FVector EndA = Center;
+		FVector EndB = Center;
+		EndA[Axis] += Ext[Axis];
+		EndB[Axis] -= Ext[Axis];
+
+		const FTransform WandTM = WandMeshComponent->GetComponentTransform();
+		const FVector WorldA = WandTM.TransformPosition(EndA);
+		const FVector WorldB = WandTM.TransformPosition(EndB);
+		const FVector HandNow = GetMesh()->GetSocketLocation(ReloadHandBoneName);
+		const FVector Tip = FVector::DistSquared(WorldA, HandNow) > FVector::DistSquared(WorldB, HandNow) ? WorldA : WorldB;
+		WandPos = Tip + ReloadWandTipOffset;
+	}
+
+	FVector Pos = HandPos;
+	float Scale = ReloadCrystalScale;
+
+	if (F < CrystalAppearEnd)
+	{
+		// Матеріалізація: росте з нуля з легким "поп"-ефектом
+		const float T = (F - CrystalAppearStart) / FMath::Max(CrystalAppearEnd - CrystalAppearStart, 0.01f);
+		Scale = ReloadCrystalScale * FMath::InterpEaseOut(0.0f, 1.0f, T, 2.0f);
+		Pos += FVector(0.0f, 0.0f, FMath::Sin(T * PI) * 2.0f);
+	}
+	else
+	{
+		// Вкладання: летить з руки в паличку й зменшується
+		const float T = (F - CrystalAppearEnd) / FMath::Max(CrystalInsertEnd - CrystalAppearEnd, 0.01f);
+		const float E = FMath::InterpEaseInOut(0.0f, 1.0f, T, 2.0f);
+		Pos = FMath::Lerp(HandPos, WandPos, E);
+		Scale = ReloadCrystalScale * (1.0f - 0.7f * E);
+	}
+
+	ReloadCrystalComponent->SetWorldLocation(Pos);
+	ReloadCrystalComponent->SetWorldRotation(FRotator(0.0f, ReloadElapsed * 180.0f, 0.0f));
+	ReloadCrystalComponent->SetWorldScale3D(FVector(Scale));
+	ReloadCrystalComponent->SetVisibility(true);
 }
 
 // Called to bind functionality to input
@@ -102,6 +209,54 @@ void ASabrinaCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCo
 	// Нові дії - додайте їх в Project Settings -> Input -> Action Mappings
 	PlayerInputComponent->BindAction("FireOrb", IE_Pressed, this, &ASabrinaCharacter::FireOrb);
 	PlayerInputComponent->BindAction("FireBeam", IE_Pressed, this, &ASabrinaCharacter::FireBeam);
+
+	// Перезарядка на клавішу R (прив'язка напряму, Project Settings міняти не треба)
+	PlayerInputComponent->BindKey(EKeys::R, IE_Pressed, this, &ASabrinaCharacter::ReloadPressed);
+}
+
+void ASabrinaCharacter::ReloadPressed()
+{
+	if (bReloadEnabled && !bIsReloading && OrbCharges < MaxOrbCharges)
+	{
+		StartReload();
+	}
+}
+
+void ASabrinaCharacter::StartReload()
+{
+	bIsReloading = true;
+
+	float Duration = FallbackReloadDuration;
+	if (ReloadMontage && GetMesh() && GetMesh()->GetAnimInstance())
+	{
+		Duration = GetMesh()->GetAnimInstance()->Montage_Play(ReloadMontage);
+		if (Duration <= 0.0f)
+		{
+			Duration = FallbackReloadDuration;
+		}
+	}
+
+	ReloadElapsed = 0.0f;
+	ReloadTotal = Duration;
+	ShowHUDMessage(TEXT("Перезарядка..."), Duration);
+	GetWorldTimerManager().SetTimer(ReloadTimerHandle, this, &ASabrinaCharacter::FinishReload, Duration, false);
+}
+
+void ASabrinaCharacter::FinishReload()
+{
+	bIsReloading = false;
+	OrbCharges = MaxOrbCharges;
+}
+
+void ASabrinaCharacter::ShowAmmoOnScreen() const
+{
+	if (bReloadEnabled && GEngine)
+	{
+		const FString Text = bIsReloading
+			? FString(TEXT("Заряди: перезарядка..."))
+			: FString::Printf(TEXT("Заряди: %d / %d  (R - перезарядка)"), OrbCharges, MaxOrbCharges);
+		GEngine->AddOnScreenDebugMessage(7140, 0.1f, FColor::Cyan, Text);
+	}
 }
 
 void ASabrinaCharacter::MoveForward(float Value)
@@ -144,9 +299,19 @@ void ASabrinaCharacter::EndJump()
 
 void ASabrinaCharacter::FireOrb()
 {
+	if (bReloadEnabled && (bIsReloading || OrbCharges <= 0))
+	{
+		return;
+	}
+
 	if (!TryUseOrb())
 	{
 		return;
+	}
+
+	if (bReloadEnabled)
+	{
+		--OrbCharges;
 	}
 
 	if (FireOrbMontage && GetMesh() && GetMesh()->GetAnimInstance())
@@ -158,6 +323,11 @@ void ASabrinaCharacter::FireOrb()
 
 void ASabrinaCharacter::FireBeam()
 {
+	if (bReloadEnabled && bIsReloading)
+	{
+		return;
+	}
+
 	if (!TryUseBeam())
 	{
 		return;
